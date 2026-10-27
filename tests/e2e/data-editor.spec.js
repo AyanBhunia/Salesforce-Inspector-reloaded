@@ -145,6 +145,91 @@ test.describe("Data Editor", () => {
     await expect(page.locator(".de-stats")).toContainText("0 of 3 rows");
     await pasteData(page, ".de-grid", "x");
     await expect(page.locator(".de-stats")).toContainText("1 of 4 rows");
+
+    // Undo/redo restores the pasted row where it was, even though it does not match the filter
+    await page.keyboard.press("Control+z");
+    await expect(page.locator(".de-stats")).toContainText("0 of 3 rows");
+    await page.keyboard.press("Control+y");
+    await expect(page.locator(".de-stats")).toContainText("1 of 4 rows");
+  });
+
+  test("Keeps an added row in place on undo and redo while sorted", async ({page, extensionId}) => {
+    await openWithData(page, extensionId);
+
+    await page.locator(".de-grid thead th", {hasText: "Name"}).click();
+    await cell(page, 0, 2).click();
+    await page.getByRole("button", {name: "Row", exact: true}).click();
+    const newRowNumber = page.locator(".de-grid tbody tr.de-new td.de-rownum");
+    await expect(newRowNumber).toHaveText("2");
+
+    await page.keyboard.press("Control+z");
+    await expect(newRowNumber).toHaveCount(0);
+    await page.keyboard.press("Control+y");
+    await expect(newRowNumber).toHaveText("2");
+  });
+
+  test("Finds and replaces, skipping read-only columns", async ({page, extensionId}) => {
+    await openWithData(page, extensionId);
+
+    await cell(page, 0, 2).click();
+    await page.keyboard.press("Control+h");
+    await page.getByLabel("Find", {exact: true}).fill("a");
+    await page.getByLabel("Replace with").fill("x");
+    await page.getByRole("button", {name: "Replace all"}).click();
+    // Case-insensitive, in all the rows; "[Account]" and the Ids are read-only
+    await expect(page.locator(".de-replacebar")).toContainText("Replaced in 2 cells");
+    await expect(cell(page, 0, 2)).toHaveText("xcme");
+    await expect(cell(page, 1, 3)).toHaveText("Bxnking");
+    await expect(cell(page, 0, 0)).toHaveText("[Account]");
+
+    // Only in the selection when several cells are selected
+    await cell(page, 0, 3).click();
+    await cell(page, 1, 3).click({modifiers: ["Shift"]});
+    await page.getByLabel("Find", {exact: true}).fill("n");
+    await page.getByLabel("Replace with").fill("N");
+    await page.keyboard.press("Enter");
+    await expect(cell(page, 0, 3)).toHaveText("ENergy");
+    await expect(cell(page, 2, 2)).toHaveText("Initech");
+
+    // One undo per replace
+    await page.getByRole("button", {name: "Undo (Ctrl+Z)"}).click();
+    await page.getByRole("button", {name: "Undo (Ctrl+Z)"}).click();
+    await expect(cell(page, 0, 2)).toHaveText("Acme");
+    await expect(cell(page, 0, 3)).toHaveText("Energy");
+  });
+
+  test("Adds a column and sends it with the changes", async ({page, extensionId}) => {
+    await openWithData(page, extensionId);
+
+    page.once("dialog", dialog => dialog.accept("Description"));
+    await page.getByRole("button", {name: "Column", exact: true}).click();
+    await expect(page.locator(".de-grid thead th").last()).toHaveText("Description");
+    await expect(cell(page, 0, 4)).toHaveClass(/de-active/);
+
+    await page.keyboard.type("Key account");
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("button", {name: "Send 1 row to Data Import"})).toBeEnabled();
+
+    // Undo the edit and the column
+    await page.keyboard.press("Control+z");
+    await page.keyboard.press("Control+z");
+    await expect(page.locator(".de-grid thead th")).toHaveText(["#", "_", "Id", "Name", "Industry"]);
+  });
+
+  test("Renders only the visible columns of a wide table", async ({page, extensionId}) => {
+    await page.goto(`chrome-extension://${extensionId}/data-editor.html?host=${mockHost}`);
+    const names = Array.from({length: 150}, (_, i) => "Field" + i + "__c");
+    const values = names.map((_, i) => "value" + i);
+    await pasteData(page, ".de-empty", names.join("\t") + "\n" + values.join("\t") + "\n");
+    await expect(cell(page, 0, 0)).toHaveText("value0");
+
+    expect(await page.locator(".de-grid thead th:not(.de-gap)").count()).toBeLessThan(60);
+    await expect(cell(page, 0, 149)).toHaveCount(0);
+
+    await cell(page, 0, 0).click();
+    await page.keyboard.press("End");
+    await expect(cell(page, 0, 149)).toHaveText("value149");
+    await expect(cell(page, 0, 0)).toHaveCount(0);
   });
 
   test("Sends only the changes to Data Import", async ({page, context, extensionId}) => {

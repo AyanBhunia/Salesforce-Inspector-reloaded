@@ -55,6 +55,26 @@ export async function saveHandoff(payload) {
 }
 
 /**
+ * Opens an extension page in a new tab with the payload.
+ * The tab is opened before the (async) save, because browsers block window.open when the click is too old.
+ * @param {string} page e.g. "data-import.html"
+ * @param {URLSearchParams} args The other URL parameters, such as host
+ * @param {Object} payload
+ * @returns {Promise<void>}
+ */
+export function openWithHandoff(page, args, payload) {
+  let win = window.open("", "_blank");
+  return saveHandoff(payload).then(key => {
+    args.set("handoff", key);
+    let url = new URL(page + "?" + args, location.href).href;
+    if (win) win.location.href = url; else window.open(url, "_blank");
+  }, err => {
+    win?.close();
+    throw err;
+  });
+}
+
+/**
  * @param {string} key
  * @returns {Promise<Object|undefined>} The stored payload, or undefined if it expired
  */

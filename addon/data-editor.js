@@ -4,11 +4,12 @@ import {sfConn} from "./inspector.js";
 import {csvParse} from "./csv-parse.js";
 import {PageHeader} from "./components/PageHeader.js";
 import {UserInfoModel, createSpinForMethod, copyToClipboard, downloadCsvFile, applyProductionStyling} from "./utils.js";
-import {saveHandoff, loadHandoff} from "./data-editor-handoff.js";
+import {openWithHandoff, loadHandoff} from "./data-editor-handoff.js";
 
 const ROW_HEIGHT = 26;
 const ROW_NUMBER_WIDTH = 56;
 const OVERSCAN = 10;
+const COLUMN_OVERSCAN = 2;
 const MAX_UNDO = 200;
 const collator = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
 
@@ -160,7 +161,9 @@ class Model {
 
   // ---------- Undoable actions ----------
   // "cells": {changes: [{row, c, before, after}]}
-  // "insert" / "delete": {items: [{row, index}]} sorted by ascending index in this.rows
+  // "insert" / "delete": {items: [{row, index, viewIndex}]} sorted by ascending index in this.rows.
+  //   The view position is restored as is, so undo/redo does not re-apply the filter and sort (rows would jump or vanish).
+  // "column": {col}, a column added at the end
   // "batch": {actions: [...]}
 
   applyAction(action, isUndo) {
@@ -174,8 +177,21 @@ class Model {
       case "delete":
         if ((action.type == "insert") != isUndo) {
           for (let item of action.items) this.rows.splice(item.index, 0, item.row);
+          for (let item of action.items.slice().sort((a, b) => a.viewIndex - b.viewIndex)) {
+            this.view.splice(Math.min(item.viewIndex, this.view.length), 0, item.row);
+          }
         } else {
           for (let i = action.items.length - 1; i >= 0; i--) this.rows.splice(action.items[i].index, 1);
+          let removed = new Set(action.items.map(item => item.row));
+          this.view = this.view.filter(row => !removed.has(row));
+        }
+        break;
+      case "column":
+        if (isUndo) this.columns.pop(); else this.columns.push(action.col);
+        for (let row of this.rows) {
+          for (let cells of row.orig ? [row.cells, row.orig] : [row.cells]) {
+            if (isUndo) cells.pop(); else cells.push("");
+          }
         }
         break;
       case "batch":
@@ -184,6 +200,7 @@ class Model {
         }
         break;
     }
+    this.editing = null;
     this.version++;
   }
 
@@ -194,16 +211,12 @@ class Model {
     this.redoStack = [];
   }
 
-  isStructural(action) {
-    return action.type != "cells" && (action.type != "batch" || action.actions.some(a => this.isStructural(a)));
-  }
-
   undo() {
     let action = this.undoStack.pop();
     if (!action) return;
     this.applyAction(action, true);
     this.redoStack.push(action);
-    if (this.isStructural(action)) this.refreshView();
+    this.clampSelection();
   }
 
   redo() {
@@ -211,7 +224,7 @@ class Model {
     if (!action) return;
     this.applyAction(action, false);
     this.undoStack.push(action);
-    if (this.isStructural(action)) this.refreshView();
+    this.clampSelection();
   }
 
   cellChanges(edits) {
@@ -224,6 +237,7 @@ class Model {
   setCells(edits) {
     let changes = this.cellChanges(edits);
     if (changes.length > 0) this.execute({type: "cells", changes});
+    return changes.length;
   }
 
   newRow() {
@@ -235,28 +249,54 @@ class Model {
 
   addRow() {
     let viewIndex = this.sel ? this.selRange().r2 + 1 : this.view.length;
-    let row = this.newRow();
     let after = this.view[viewIndex - 1];
     let index = after ? this.rows.indexOf(after) + 1 : this.rows.length;
-    this.execute({type: "insert", items: [{row, index}]});
-    this.view.splice(viewIndex, 0, row);
-    this.editing = null;
+    this.execute({type: "insert", items: [{row: this.newRow(), index, viewIndex}]});
     this.sel = {ar: viewIndex, ac: 0, fr: viewIndex, fc: 0};
   }
 
   deleteSelectedRows() {
     if (!this.sel) return;
     let {r1, r2} = this.selRange();
-    let removed = new Set(this.view.slice(r1, r2 + 1));
+    let viewIndexes = new Map(this.view.slice(r1, r2 + 1).map((row, i) => [row, r1 + i]));
     let items = [];
     this.rows.forEach((row, index) => {
-      if (removed.has(row)) items.push({row, index});
+      if (viewIndexes.has(row)) items.push({row, index, viewIndex: viewIndexes.get(row)});
     });
     this.execute({type: "delete", items});
-    this.view = this.view.filter(row => !removed.has(row));
-    this.editing = null;
     let r = Math.min(r1, this.view.length - 1);
     this.sel = r >= 0 ? {ar: r, ac: this.sel.fc, fr: r, fc: this.sel.fc} : null;
+  }
+
+  addColumn(name) {
+    name = (name || "").trim();
+    if (!name) return;
+    if (isLockedColumn(name) || this.columns.some(col => col.name.toLowerCase() == name.toLowerCase())) {
+      this.errorMessage = "The column " + name + " cannot be added: it already exists or is read-only.";
+      return;
+    }
+    this.errorMessage = "";
+    this.execute({type: "column", col: {name, width: estimateWidth(name, [], 0), locked: false}});
+    let c = this.columns.length - 1;
+    this.sel = this.view.length > 0 ? {ar: 0, ac: c, fr: 0, fc: c} : null;
+  }
+
+  replaceAll(find, replacement) {
+    // Case-insensitive, in the selection when it spans several cells, otherwise in all the rows shown
+    if (!find || this.view.length == 0) return 0;
+    let pattern = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    let range = this.sel ? this.selRange() : null;
+    if (!range || (range.r1 == range.r2 && range.c1 == range.c2)) {
+      range = {r1: 0, r2: this.view.length - 1, c1: 0, c2: this.columns.length - 1};
+    }
+    let edits = [];
+    for (let r = range.r1; r <= range.r2; r++) {
+      for (let c = range.c1; c <= range.c2; c++) {
+        let row = this.view[r];
+        edits.push({row, c, value: row.cells[c].replace(pattern, () => replacement)});
+      }
+    }
+    return this.setCells(edits);
   }
 
   // ---------- Selection ----------
@@ -277,6 +317,16 @@ class Model {
     r = Math.max(0, Math.min(this.view.length - 1, r));
     c = Math.max(0, Math.min(this.columns.length - 1, c));
     this.sel = extend && this.sel ? {...this.sel, fr: r, fc: c} : {ar: r, ac: c, fr: r, fc: c};
+  }
+
+  clampSelection() {
+    // After undo/redo, rows or the last column may be gone
+    if (this.sort && this.sort.col >= this.columns.length) this.sort = null;
+    let sel = this.sel;
+    if (sel && Math.max(sel.ar, sel.fr) < this.view.length && Math.max(sel.ac, sel.fc) < this.columns.length) return;
+    let {fr, fc} = sel || {fr: 0, fc: 0};
+    this.sel = null;
+    this.select(fr, fc, false);
   }
 
   selectRows(r1, r2) {
@@ -381,7 +431,7 @@ class Model {
       let row = this.view[r1 + i];
       if (!row) {
         row = this.newRow();
-        inserted.push({row, index: this.rows.length + inserted.length});
+        inserted.push({row, index: this.rows.length + inserted.length, viewIndex: r1 + i});
       }
       grid[i].forEach((value, j) => {
         if (c1 + j < this.columns.length) edits.push({row, c: c1 + j, value});
@@ -393,7 +443,6 @@ class Model {
     if (changes.length > 0) actions.push({type: "cells", changes});
     if (actions.length == 0) return;
     this.execute({type: "batch", actions});
-    this.view.push(...inserted.map(item => item.row));
     this.sel = {ar: r1, ac: c1, fr: r1 + grid.length - 1, fc: Math.min(this.columns.length - 1, c1 + grid[0].length - 1)};
   }
 
@@ -433,13 +482,9 @@ class Model {
   }
 
   sendToImport() {
-    let payload = this.importPayload();
-    this.spinFor(saveHandoff(payload).then(key => {
-      let args = new URLSearchParams();
-      args.set("host", this.sfHost);
-      args.set("handoff", key);
-      this.sentVersion = this.version;
-      window.open("data-import.html?" + args, "_blank");
+    let version = this.version;
+    this.spinFor(openWithHandoff("data-import.html", new URLSearchParams({host: this.sfHost}), this.importPayload()).then(() => {
+      this.sentVersion = version;
     }));
   }
 }
@@ -450,7 +495,7 @@ class Grid extends React.Component {
   constructor(props) {
     super(props);
     this.scroller = null;
-    this.state = {scrollTop: 0, viewportHeight: 600};
+    this.state = {scrollTop: 0, scrollLeft: 0, viewportHeight: 600, viewportWidth: 1200};
     this.dragging = false;
     this.onScroll = this.onScroll.bind(this);
     this.onKeyDown = this.onKeyDown.bind(this);
@@ -486,14 +531,14 @@ class Grid extends React.Component {
   }
 
   onResize() {
-    this.setState({viewportHeight: this.scroller.clientHeight});
+    this.setState({viewportHeight: this.scroller.clientHeight, viewportWidth: this.scroller.clientWidth});
   }
 
   onScroll() {
     if (this.scrollFrame) return;
     this.scrollFrame = requestAnimationFrame(() => {
       this.scrollFrame = null;
-      this.setState({scrollTop: this.scroller.scrollTop});
+      this.setState({scrollTop: this.scroller.scrollTop, scrollLeft: this.scroller.scrollLeft});
     });
   }
 
@@ -568,9 +613,17 @@ class Grid extends React.Component {
 
   onKeyDown(e) {
     let {model} = this.props;
-    if (e.target != this.scroller || !model.sel) return;
+    if (e.target != this.scroller) return;
     let ctrl = e.ctrlKey || e.metaKey;
     let key = e.key;
+    // Undo/redo also works when nothing is selected (e.g. the filter hides every row)
+    if (ctrl && (key.toLowerCase() == "z" || key.toLowerCase() == "y")) {
+      e.preventDefault();
+      if (key.toLowerCase() == "y" || e.shiftKey) model.redo(); else model.undo();
+      this.update();
+      return;
+    }
+    if (!model.sel) return;
     let {fr, fc} = model.sel;
     let pageRows = Math.max(1, Math.floor(this.scroller.clientHeight / ROW_HEIGHT) - 1);
     let lastRow = model.view.length - 1;
@@ -580,15 +633,7 @@ class Grid extends React.Component {
       model.select(r, c, e.shiftKey);
       this.update();
     };
-    if (ctrl && key.toLowerCase() == "z") {
-      e.preventDefault();
-      if (e.shiftKey) model.redo(); else model.undo();
-      this.update();
-    } else if (ctrl && key.toLowerCase() == "y") {
-      e.preventDefault();
-      model.redo();
-      this.update();
-    } else if (ctrl && key.toLowerCase() == "a") {
+    if (ctrl && key.toLowerCase() == "a") {
       e.preventDefault();
       model.selectAll();
       model.didUpdate();
@@ -623,7 +668,7 @@ class Grid extends React.Component {
     } else if (key == "Enter" || key == "F2") {
       e.preventDefault();
       model.beginEdit();
-      model.didUpdate();
+      this.update(); // The cell must be rendered (scrolled into view) to show its editor
     } else if (key == "Delete" || key == "Backspace") {
       e.preventDefault();
       model.clearSelection();
@@ -635,7 +680,7 @@ class Grid extends React.Component {
       // Typing replaces the cell content, like in a spreadsheet
       e.preventDefault();
       model.beginEdit(key);
-      model.didUpdate();
+      this.update();
     }
   }
 
@@ -710,19 +755,57 @@ class Grid extends React.Component {
     return h("td", {key: c, "data-r": r, "data-c": c, className, title: value.length > 30 ? value : null}, value);
   }
 
+  renderHeader(c) {
+    let {model} = this.props;
+    let col = model.columns[c];
+    return h("th", {
+      key: c,
+      className: col.locked ? "de-locked" : null,
+      title: col.name + (col.locked ? " (read-only)" : "") + " - click to sort",
+      onClick: () => { model.toggleSort(c); model.didUpdate(); }
+    },
+    h("div", {className: "de-th-inner"},
+      col.name,
+      model.sort?.col == c ? h("span", {className: "de-sort"}, model.sort.dir == 1 ? "▲" : "▼") : null
+    ),
+    h("div", {className: "de-resizer", onMouseDown: e => this.onResizeStart(e, col), onClick: e => e.stopPropagation()})
+    );
+  }
+
+  visibleColumns() {
+    // Only the columns in the viewport are rendered; spacers stand in for the others
+    let {model} = this.props;
+    let {scrollLeft, viewportWidth} = this.state;
+    let lefts = [0];
+    for (let col of model.columns) lefts.push(lefts[lefts.length - 1] + col.width);
+    let first = 0;
+    while (first < model.columns.length - 1 && lefts[first + 1] < scrollLeft) first++;
+    let last = first;
+    while (last < model.columns.length && lefts[last] < scrollLeft + viewportWidth) last++;
+    first = Math.max(0, first - COLUMN_OVERSCAN);
+    last = Math.min(model.columns.length, last + COLUMN_OVERSCAN);
+    let indexes = [];
+    for (let c = first; c < last; c++) indexes.push(c);
+    return {indexes, before: lefts[first], after: lefts[model.columns.length] - lefts[last], total: lefts[model.columns.length]};
+  }
+
   render() {
     let {model} = this.props;
     let {scrollTop, viewportHeight} = this.state;
     let first = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
     let last = Math.min(model.view.length, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN);
-    let totalWidth = ROW_NUMBER_WIDTH + model.columns.reduce((sum, col) => sum + col.width, 0);
-    let spacer = height => h("tr", {"aria-hidden": "true"}, h("td", {colSpan: model.columns.length + 1, style: {height, padding: 0, border: 0}}));
+    let cols = this.visibleColumns();
+    let totalWidth = ROW_NUMBER_WIDTH + cols.total;
+    let gap = (tag, width) => (width > 0 ? h(tag, {className: "de-gap", "aria-hidden": "true"}) : null);
+    let spacer = height => h("tr", {"aria-hidden": "true"}, h("td", {colSpan: cols.indexes.length + 3, style: {height, padding: 0, border: 0}}));
     let rows = [];
     for (let r = first; r < last; r++) {
       let row = model.view[r];
       rows.push(h("tr", {key: r, className: row.orig ? null : "de-new"},
         h("td", {className: "de-rownum", "data-r": r, "data-c": -1}, r + 1),
-        model.columns.map((col, c) => this.renderCell(row, r, c))
+        gap("td", cols.before),
+        cols.indexes.map(c => this.renderCell(row, r, c)),
+        gap("td", cols.after)
       ));
     }
     return h("div", {
@@ -738,23 +821,16 @@ class Grid extends React.Component {
     h("table", {style: {width: totalWidth}},
       h("colgroup", null,
         h("col", {style: {width: ROW_NUMBER_WIDTH}}),
-        model.columns.map((col, c) => h("col", {key: c, style: {width: col.width}}))
+        cols.before > 0 ? h("col", {style: {width: cols.before}}) : null,
+        cols.indexes.map(c => h("col", {key: c, style: {width: model.columns[c].width}})),
+        cols.after > 0 ? h("col", {style: {width: cols.after}}) : null
       ),
       h("thead", null,
         h("tr", null,
           h("th", {className: "de-rownum"}, "#"),
-          model.columns.map((col, c) => h("th", {
-            key: c,
-            className: col.locked ? "de-locked" : null,
-            title: col.name + (col.locked ? " (read-only)" : "") + " - click to sort",
-            onClick: () => { model.toggleSort(c); model.didUpdate(); }
-          },
-          h("div", {className: "de-th-inner"},
-            col.name,
-            model.sort?.col == c ? h("span", {className: "de-sort"}, model.sort.dir == 1 ? "▲" : "▼") : null
-          ),
-          h("div", {className: "de-resizer", onMouseDown: e => this.onResizeStart(e, col), onClick: e => e.stopPropagation()})
-          ))
+          gap("th", cols.before),
+          cols.indexes.map(c => this.renderHeader(c)),
+          gap("th", cols.after)
         )
       ),
       h("tbody", {onMouseDown: this.onMouseDown, onMouseOver: this.onMouseOver, onDoubleClick: this.onDoubleClick},
@@ -771,8 +847,10 @@ class App extends React.Component {
   constructor(props) {
     super(props);
     this.grid = null;
+    this.state = {replace: null}; // {find, replacement, message} while the Find & Replace bar is open
     this.onCopy = this.onCopy.bind(this);
     this.onPaste = this.onPaste.bind(this);
+    this.onKeyDown = this.onKeyDown.bind(this);
     this.onBeforeUnload = this.onBeforeUnload.bind(this);
   }
 
@@ -780,6 +858,7 @@ class App extends React.Component {
     document.addEventListener("copy", this.onCopy);
     document.addEventListener("cut", this.onCopy);
     document.addEventListener("paste", this.onPaste);
+    document.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("beforeunload", this.onBeforeUnload);
   }
 
@@ -787,7 +866,38 @@ class App extends React.Component {
     document.removeEventListener("copy", this.onCopy);
     document.removeEventListener("cut", this.onCopy);
     document.removeEventListener("paste", this.onPaste);
+    document.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("beforeunload", this.onBeforeUnload);
+  }
+
+  onKeyDown(e) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() == "h" && this.props.model.hasData) {
+      e.preventDefault();
+      this.toggleReplace(true);
+    }
+  }
+
+  toggleReplace(open) {
+    this.setState({replace: open ? (this.state.replace || {find: "", replacement: "", message: ""}) : null}, () => {
+      if (open) this.findInput?.focus(); else this.grid?.scroller.focus();
+    });
+  }
+
+  updateReplace(changes) {
+    this.setState({replace: {...this.state.replace, message: "", ...changes}});
+  }
+
+  replaceAll() {
+    let {model} = this.props;
+    let {find, replacement} = this.state.replace;
+    let count = model.replaceAll(find, replacement);
+    this.updateReplace({message: count == 0 ? "No match" : "Replaced in " + count.toLocaleString() + (count == 1 ? " cell" : " cells")});
+    model.didUpdate();
+  }
+
+  addColumn() {
+    let name = window.prompt("Name of the column to add (the field API name, so Data Import can map it):");
+    if (name != null) this.act(() => this.props.model.addColumn(name));
   }
 
   gridFocused() {
@@ -837,7 +947,13 @@ class App extends React.Component {
   act(fn) {
     let {model} = this.props;
     fn();
-    if (this.grid) this.grid.update(); else model.didUpdate();
+    if (this.grid) {
+      // Give the keyboard back to the table after a toolbar button
+      this.grid.scroller.focus({preventScroll: true});
+      this.grid.update();
+    } else {
+      model.didUpdate();
+    }
   }
 
   renderToolbar() {
@@ -852,8 +968,10 @@ class App extends React.Component {
       ),
       h("div", {className: "slds-button-group", role: "group"},
         this.textButton("add", "Row", "Add an empty row below the selection", () => this.act(() => model.addRow()), false),
+        this.textButton("add", "Column", "Add a column at the end, to set a field that was not queried", () => this.addColumn(), false),
         this.textButton("delete", "Delete rows", "Remove the selected rows from this table (nothing is deleted in Salesforce)", () => this.act(() => model.deleteSelectedRows()), !model.sel)
       ),
+      this.textButton("replace", "Replace", "Find and replace (Ctrl+H), in the selected cells or in all the rows shown", () => this.toggleReplace(!this.state.replace), false),
       h("div", {className: "slds-form-element de-filter"},
         h("div", {className: "slds-form-element__control slds-input-has-icon slds-input-has-icon_left"},
           h("svg", {className: "slds-icon slds-input__icon slds-input__icon_left slds-icon-text-default"}, h("use", {xlinkHref: "symbols.svg#search"})),
@@ -884,6 +1002,38 @@ class App extends React.Component {
         )
       ),
       this.textButton("upload", "Send " + sendCount.toLocaleString() + (sendCount == 1 ? " row" : " rows") + " to Data Import", "Open Data Import preloaded with these rows. You review and run the import there.", () => model.sendToImport(), sendCount == 0, "slds-button_brand")
+    );
+  }
+
+  renderReplaceBar() {
+    let {replace} = this.state;
+    if (!replace) return null;
+    let onKeyDown = e => {
+      if (e.key == "Enter") this.replaceAll();
+      if (e.key == "Escape") this.toggleReplace(false);
+    };
+    return h("div", {className: "de-valuebar de-replacebar"},
+      h("input", {
+        className: "slds-input",
+        ref: el => { this.findInput = el; },
+        placeholder: "Find",
+        "aria-label": "Find",
+        value: replace.find,
+        onChange: e => this.updateReplace({find: e.target.value}),
+        onKeyDown
+      }),
+      h("input", {
+        className: "slds-input",
+        placeholder: "Replace with",
+        "aria-label": "Replace with",
+        value: replace.replacement,
+        onChange: e => this.updateReplace({replacement: e.target.value}),
+        onKeyDown
+      }),
+      h("button", {className: "slds-button slds-button_neutral", disabled: !replace.find, onClick: () => this.replaceAll()}, "Replace all"),
+      h("span", {className: "de-stats", role: "status"}, replace.message),
+      h("div", {className: "de-spacer"}),
+      this.iconButton("close", "Close (Escape)", () => this.toggleReplace(false), false)
     );
   }
 
@@ -930,6 +1080,7 @@ class App extends React.Component {
         h("div", {className: "slds-card slds-m-around_medium", style: {flex: "1 1 0", display: "flex", flexDirection: "column", minHeight: 0}},
           model.errorMessage ? h("div", {className: "slds-notify slds-notify_alert slds-alert_error", role: "alert"}, model.errorMessage) : null,
           model.hasData ? this.renderToolbar() : null,
+          model.hasData ? this.renderReplaceBar() : null,
           model.hasData ? this.renderValueBar() : null,
           model.hasData
             ? h(Grid, {model, ref: grid => { this.grid = grid; }})
@@ -944,7 +1095,8 @@ class App extends React.Component {
               h("kbd", null, "Enter"), " save & move down · ",
               h("kbd", null, "Ctrl+Enter"), " fill selection · ",
               h("kbd", null, "Ctrl+C"), "/", h("kbd", null, "Ctrl+V"), " copy & paste · ",
-              h("kbd", null, "Ctrl+Z"), " undo · click a header to sort, drag its edge to resize"
+              h("kbd", null, "Ctrl+Z"), " undo · ",
+              h("kbd", null, "Ctrl+H"), " replace · click a header to sort, drag its edge to resize"
             )
             : null
         )

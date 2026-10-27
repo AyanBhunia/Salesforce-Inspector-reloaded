@@ -7,8 +7,12 @@
   border-bottom: 1px solid #dddbda;
 }
 
-.de-toolbar .de-spacer {
+.de-spacer {
   flex: 1 1 auto;
+}
+
+.de-valuebar.de-replacebar input {
+  flex: 0 1 16rem;
 }
 
 .de-toolbar .de-filter {
@@ -100,6 +104,13 @@
   color: #706e6b;
   background: #f3f3f3;
   cursor: pointer;
+}
+
+/* Stands in for the columns that are scrolled out of view */
+.de-grid .de-gap {
+  padding: 0;
+  border-right: 0;
+  cursor: default;
 }
 
 .de-grid thead .de-rownum {

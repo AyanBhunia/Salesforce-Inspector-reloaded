@@ -18,13 +18,15 @@ The Data Editor is a spreadsheet-like table where you can review and change reco
 | Select | Click, <kbd>Shift</kbd>+click or drag; click row numbers to select rows; <kbd>Ctrl</kbd>+<kbd>A</kbd> selects all |
 | Copy / paste | <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>V</kbd>, compatible with Excel. Pasting below the last row adds rows |
 | Clear | <kbd>Delete</kbd> or <kbd>Backspace</kbd> |
+| Find & replace | **Replace** or <kbd>Ctrl</kbd>+<kbd>H</kbd>. Case-insensitive, in the selected cells when several are selected, otherwise in all the rows shown. Read-only columns are skipped |
+| Set a field that was not queried | **Column** adds a column at the end. Use the field API name so Data Import maps it |
 | Undo / redo | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> |
 | Add / remove rows | **Row** and **Delete rows** buttons. Removing a row only removes it from the table, not from Salesforce |
 | Sort, filter, resize | Click a header to sort (ascending, descending, none), type in **Filter rows**, drag a header edge |
 
 The value bar above the table shows the full value of the active cell and can be used to edit long values.
 
-Edited cells are highlighted, and new rows are marked in the row numbers. The `_` (record type) and `Id` columns are read-only.
+Edited cells are highlighted, and new rows are marked in the row numbers. The `_` (record type) and `Id` columns are read-only. Subquery results and compound fields (such as addresses) are shown as JSON; Data Import cannot write them.
 
 ## Send to Data Import
 
