@@ -797,7 +797,7 @@ class Grid extends React.Component {
     let cols = this.visibleColumns();
     let totalWidth = ROW_NUMBER_WIDTH + cols.total;
     let gap = (tag, width) => (width > 0 ? h(tag, {className: "de-gap", "aria-hidden": "true"}) : null);
-    let spacer = height => h("tr", {"aria-hidden": "true"}, h("td", {colSpan: cols.indexes.length + 3, style: {height, padding: 0, border: 0}}));
+    let spacer = height => h("tr", {"aria-hidden": "true"}, h("td", {colSpan: 1 + (cols.before > 0) + cols.indexes.length + (cols.after > 0), style: {height, padding: 0, border: 0}}));
     let rows = [];
     for (let r = first; r < last; r++) {
       let row = model.view[r];
