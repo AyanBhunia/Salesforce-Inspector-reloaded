@@ -142,6 +142,7 @@ class Model {
     data.endpoint = "/services/data/v" + apiVersion + "/" + method + queryParams;
     data.params = params;
     data.queryMethod = method;
+    data.query = query;
   }
   setQueryName(value) {
     this.queryName = value;
@@ -263,6 +264,10 @@ class Model {
   canCopy() {
     return this.exportedData != null && this.exportedData.table.length > 0;
   }
+  canEdit() {
+    // SOQL results only: SOSL and GraphQL can return several objects in one table
+    return this.canCopy() && ["query", "queryAll", "tooling/query"].includes(this.exportedData.queryMethod);
+  }
   canDelete() {
     //In order to allow deletion, we should have at least 1 element and the Id field should have been included in the query
     return this.exportedData
@@ -296,7 +301,7 @@ class Model {
   }
   openInEditor() {
     let [header, ...rows] = this.exportedData.getVisibleStrings();
-    let payload = {header, rows, apiType: this.queryTooling ? "Tooling" : "Enterprise"};
+    let payload = {header, rows, apiType: this.exportedData.isTooling ? "Tooling" : "Enterprise", query: this.exportedData.query};
     // Always a new tab, so the query and its results stay available here
     this.spinFor(openWithHandoff("data-editor.html", new URLSearchParams({host: this.sfHost}), payload));
   }
@@ -2088,7 +2093,7 @@ class App extends React.Component {
                     h("use", {xlinkHref: "symbols.svg#hide"})
                   )
                 ),
-                h("button", {className: "slds-button slds-button_neutral", disabled: !model.canCopy(), onClick: this.onOpenInEditor, title: "Edit the results in a spreadsheet-like table, then send the changes to Data Import"},
+                h("button", {className: "slds-button slds-button_neutral", disabled: !model.canEdit(), onClick: this.onOpenInEditor, title: "Edit the results in a spreadsheet-like table, then send the changes to Data Import"},
                   h("svg", {className: "slds-button__icon slds-button__icon_left"},
                     h("use", {xlinkHref: "symbols.svg#edit"})
                   ),

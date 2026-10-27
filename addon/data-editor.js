@@ -1,9 +1,10 @@
 /* global React ReactDOM */
-import {sfConn, apiVersion} from "./inspector.js";
+import {sfConn} from "./inspector.js";
 /* global initButton */
 import {csvParse} from "./csv-parse.js";
+import {DescribeInfo} from "./data-load.js";
 import {PageHeader} from "./components/PageHeader.js";
-import {UserInfoModel, createSpinForMethod, copyToClipboard, downloadCsvFile, applyProductionStyling} from "./utils.js";
+import {UserInfoModel, createSpinForMethod, copyToClipboard, downloadCsvFile, applyProductionStyling, isRecordId} from "./utils.js";
 import {openWithHandoff, loadHandoff} from "./data-editor-handoff.js";
 
 const ROW_HEIGHT = 26;
@@ -48,7 +49,7 @@ function fieldWarning(field, value) {
       return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? "" : "Expected an email address";
     case "id":
     case "reference":
-      return /^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$/.test(v) ? "" : "Expected a record Id (15 or 18 characters)";
+      return isRecordId(v) ? "" : "Expected a record Id (15 or 18 characters)";
     case "picklist":
     case "multipicklist": {
       let items = field.type == "picklist" ? [v] : v.split(";").map(item => item.trim()).filter(item => item);
@@ -88,7 +89,10 @@ class Model {
     applyProductionStyling(sfHost);
 
     this.columns = []; // {name, width, locked, createOnly, reason, field}, see columnAccess
+    this.describeInfo = new DescribeInfo(this.spinFor, () => this.applyDescribe());
     this.fields = null; // Map of lower case field name to field describe, once the object's describe is loaded
+    this.readOnlyReason = ""; // Set when no row can be written (aggregate query, read-only object)
+    this.displayColumns = new Set(); // Lower case names of the columns that hold display values (see setTable)
     this.rows = []; // {cells: string[], orig: string[] | null}. orig is null for rows added in the editor
     this.view = []; // the rows currently displayed, after filter and sort
     this.filter = "";
@@ -116,13 +120,16 @@ class Model {
     return this.columns.length > 0;
   }
 
-  setTable(header, rows, {apiType, changesOnly}) {
+  setTable(header, rows, {apiType, changesOnly, query}) {
     let typeColumn = header.indexOf("_");
     let typeCell = typeColumn >= 0 && rows[0] ? rows[0][typeColumn] : "";
     this.sobject = /^\[\w+\]$/.test(typeCell) ? typeCell.slice(1, -1) : "";
     this.apiType = apiType || "Enterprise";
-    this.fields = null;
-    this.columns = header.map((name, c) => ({name, width: estimateWidth(name, rows, c), ...this.columnAccess(name)}));
+    // toLabel(), FORMAT() and convertCurrency() in the SELECT clause return display values (column named after the alias or the field)
+    let selectClause = (query || "").split(/\bfrom\b/i)[0];
+    let displayFunctions = /\b(?:toLabel|format|convertCurrency)\s*\(\s*([\w.]+)\s*\)(?:\s+(\w+))?/gi;
+    this.displayColumns = new Set(Array.from(selectClause.matchAll(displayFunctions), m => (m[2] || m[1]).toLowerCase()));
+    this.columns = header.map((name, c) => ({name, width: estimateWidth(name, rows, c)}));
     this.rows = rows.map(cells => {
       let padded = header.map((_, c) => cells[c] ?? "");
       return {cells: padded, orig: padded.slice()};
@@ -136,37 +143,39 @@ class Model {
     this.sentVersion = this.version;
     this.refreshView();
     document.title = "Data Editor" + (this.sobject ? " - " + this.sobject : "");
-    this.loadDescribe();
+    this.applyDescribe();
   }
 
   // ---------- Field access and types ----------
 
-  loadDescribe() {
-    if (!this.sobject) return;
-    let sobject = this.sobject;
-    let path = "/services/data/v" + apiVersion + (this.apiType == "Tooling" ? "/tooling" : "") + "/sobjects/" + sobject + "/describe";
-    this.spinFor(sfConn.rest(path).then(describe => {
-      if (this.sobject != sobject) return;
-      this.fields = new Map(describe.fields.map(field => [field.name.toLowerCase(), field]));
-      for (let col of this.columns) Object.assign(col, this.columnAccess(col.name));
-      this.version++; // Warnings depend on the describe
-    }, err => {
-      // Without the describe every column stays editable, as for pasted data
-      console.error("Data Editor: could not describe " + sobject, err);
-    }));
+  applyDescribe() {
+    // Also called back by DescribeInfo once the describe it started loading has arrived
+    let describable = this.sobject && this.sobject != "AggregateResult";
+    let {sobjectDescribe} = describable ? this.describeInfo.describeSobject(this.apiType == "Tooling", this.sobject) : {};
+    this.fields = sobjectDescribe ? new Map(sobjectDescribe.fields.map(field => [field.name.toLowerCase(), field])) : null;
+    this.readOnlyReason = this.sobject == "AggregateResult" ? "Aggregate query results cannot be imported"
+      : sobjectDescribe && !sobjectDescribe.createable && !sobjectDescribe.updateable ? this.sobject + " records cannot be created or updated"
+      : "";
+    for (let col of this.columns) Object.assign(col, this.columnAccess(col.name));
+    this.version++; // Warnings depend on the describe
   }
 
   columnAccess(name) {
     let access = (locked, reason, field = null, createOnly = false) => ({locked, reason, field, createOnly});
     if (name == "_") return access(true, "Record type, used by Data Import to find the object");
     if (name.toLowerCase() == "id") return access(true, "Record Id, used by Data Import to find the record");
+    if (this.readOnlyReason) return access(true, this.readOnlyReason);
+    if (this.displayColumns.has(name.toLowerCase())) {
+      return access(true, "Display value (toLabel, FORMAT or convertCurrency in the query): writing it back would store the wrong value");
+    }
     if (!this.fields || name.includes(":")) return access(false, ""); // No describe (pasted data), or Data Import's Relationship:Object:ExternalIdField syntax
     let field = this.fields.get(name.toLowerCase());
     if (!field) {
       return access(true, name.includes(".")
-        ? "Field of a related record (parent or subquery): it cannot be written from this table"
+        ? "Field of a related record. To change the parent, edit its lookup field (such as AccountId). To edit child records, query their object."
         : "Not a field of " + this.sobject + " (related record, subquery or alias)");
     }
+    if (field.type == "encryptedstring") return access(true, "Encrypted field: the value may be masked, writing it back would overwrite the real value", field);
     if (field.updateable) return access(false, "", field);
     if (field.createable) return access(false, "Can only be set on new rows", field, true);
     return access(true, "Read-only field (formula, system or compound field, or no edit access)", field);
@@ -609,7 +618,8 @@ class Model {
     }
     // Without any Id value (only new rows), drop the column so Data Import proposes Insert instead of Update
     cols = cols.filter(c => this.columns[c].name.toLowerCase() != "id" || rows.some(row => row.cells[c] != ""));
-    let header = cols.map(c => this.columns[c].name);
+    // Read-only columns are sent with a "_" prefix, which Data Import shows as skipped
+    let header = cols.map(c => this.columns[c]).map(col => (col.locked && !isKeyColumn(col.name) ? "_" : "") + col.name);
     let text = serialize(header, rows.map(row => cols.map(c => row.cells[c])), "\t");
     return {text, apiType: this.apiType};
   }
@@ -1143,7 +1153,7 @@ class App extends React.Component {
           h("span", {className: "slds-form-element__label"}, "Changes only")
         )
       ),
-      this.textButton("upload", "Send " + sendCount.toLocaleString() + (sendCount == 1 ? " row" : " rows") + " to Data Import", "Open Data Import preloaded with these rows. You review and run the import there.", () => model.sendToImport(), sendCount == 0, "slds-button_brand")
+      this.textButton("upload", "Send " + sendCount.toLocaleString() + (sendCount == 1 ? " row" : " rows") + " to Data Import", model.readOnlyReason || "Open Data Import preloaded with these rows. You review and run the import there.", () => model.sendToImport(), sendCount == 0 || !!model.readOnlyReason, "slds-button_brand")
     );
   }
 
@@ -1269,7 +1279,7 @@ class App extends React.Component {
           model.errorMessage = "The data is no longer available. Open it again from Data Export.";
           return;
         }
-        model.setTable(payload.header, payload.rows, {apiType: payload.apiType, changesOnly: true});
+        model.setTable(payload.header, payload.rows, {apiType: payload.apiType, changesOnly: true, query: payload.query});
       }).catch(err => {
         model.errorMessage = "Could not load the data: " + err.message;
       }));

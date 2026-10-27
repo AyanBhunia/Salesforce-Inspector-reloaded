@@ -4,7 +4,7 @@ The Data Editor is a spreadsheet-like table where you can review and change reco
 
 ## Open the editor
 
-- From **Data Export**, run a query and click **Edit** in the result toolbar. The visible rows and columns open in a new tab (the result filter and *Hide Object Columns* are respected).
+- From **Data Export**, run a SOQL query and click **Edit** in the result toolbar (not available for SOSL and GraphQL results). The visible rows and columns open in a new tab (the result filter and *Hide Object Columns* are respected).
 - Or open `data-editor.html` and paste cells copied from Excel or Google Sheets (<kbd>Ctrl</kbd>+<kbd>V</kbd>). The first line is used as the header.
 
 ## Edit
@@ -33,7 +33,10 @@ Edited cells are highlighted, and new rows are marked in the row numbers.
 
 When the rows come from one object (the `_` column, for example `[Account]`), the editor reads the object's fields:
 
-- Columns that cannot be written are greyed out: the `_` and `Id` columns, read-only fields (formula, system and compound fields, or fields you cannot edit), and fields of related records (`Owner.Name`, subqueries, aliases). Point at a cell to see why. Fields that can only be set on creation are editable on new rows only.
+- Columns that cannot be written are greyed out: the `_` and `Id` columns, read-only fields (formula, system and compound fields, or fields you cannot edit), encrypted fields, values returned by `toLabel()`, `FORMAT()` or `convertCurrency()`, and fields of related records (`Owner.Name`, subqueries, aliases). Point at a cell to see why. Fields that can only be set on creation are editable on new rows only.
+- To change a parent record, edit the lookup field (for example `AccountId`). To edit child records, query their object in Data Export.
+- Aggregate query results and objects that cannot be created or updated open read-only.
+- Read-only columns are sent to Data Import with a `_` prefix, so they are shown there but skipped.
 - When you leave an edited cell, its value is checked against the field type (number, date, date/time, boolean, email, Id, picklist value, maximum length, required). A mismatch shows a warning icon in the cell, the reason in the value bar, and the number of warnings next to the row count. Warnings do not block sending: Data Import reports the actual errors.
 
 Subquery results and compound fields (such as addresses) are shown as JSON.

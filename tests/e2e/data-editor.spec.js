@@ -34,6 +34,8 @@ test.describe("Data Editor", () => {
   const picklist = values => values.map(value => ({value, label: value, active: true}));
   const accountDescribe = {
     name: "Account",
+    createable: true,
+    updateable: true,
     fields: [
       {name: "Id", type: "id", createable: false, updateable: false, nillable: false},
       {name: "Name", type: "string", length: 20, createable: true, updateable: true, nillable: false},
@@ -66,9 +68,27 @@ test.describe("Data Editor", () => {
       return saveHandoff(payload);
     }, {...data, apiType: "Enterprise"});
     await page.goto(`chrome-extension://${extensionId}/data-editor.html?host=${mockHost}&handoff=${key}`);
-    await expect(page.locator(".de-grid tbody tr").filter({hasText: "Acme"})).toBeVisible();
-    // The describe is loaded: the Name header (column 2) shows its type
-    await expect(page.locator(".de-grid thead th").nth(3)).toHaveAttribute("title", /^Name \(string\)/);
+    await expect(cell(page, 0, 0)).toHaveText(data.rows[0][0]);
+    if (data.header[2] == "Name") {
+      // The describe is loaded: the Name header shows its type
+      await expect(page.locator(".de-grid thead th").nth(3)).toHaveAttribute("title", /^Name \(string\)/);
+    }
+  }
+
+  async function sentPayload(page, context, buttonName) {
+    const [popup] = await Promise.all([
+      context.waitForEvent("page"),
+      page.getByRole("button", {name: buttonName}).click()
+    ]);
+    await popup.waitForURL(/data-import.html/);
+    const importUrl = popup.url();
+    // Extension APIs are not available in tabs opened by window.open under Playwright, so read the payload here
+    await popup.close();
+    const payload = await page.evaluate(async key => {
+      const {loadHandoff} = await import("./data-editor-handoff.js");
+      return loadHandoff(key);
+    }, new URL(importUrl).searchParams.get("handoff"));
+    return {payload, importUrl};
   }
 
   function cell(page, r, c) {
@@ -368,29 +388,40 @@ test.describe("Data Editor", () => {
     await page.keyboard.type("Insurance");
     await page.keyboard.press("Enter");
 
-    const sendButton = page.getByRole("button", {name: "Send 1 row to Data Import"});
-    await expect(sendButton).toBeEnabled();
-
-    const [popup] = await Promise.all([
-      context.waitForEvent("page"),
-      sendButton.click()
-    ]);
-    await popup.waitForURL(/data-import.html/);
-    const importUrl = popup.url();
-    expect(importUrl).toContain("data-import.html");
-    expect(importUrl).toContain("handoff=");
-    // Extension APIs are not available in tabs opened by window.open under Playwright, so load the URL in a regular page
-    await popup.close();
-
     // Only the record type, the Id and the edited column are sent
-    const payload = await page.evaluate(async key => {
-      const {loadHandoff} = await import("./data-editor-handoff.js");
-      return loadHandoff(key);
-    }, new URL(importUrl).searchParams.get("handoff"));
+    const {payload, importUrl} = await sentPayload(page, context, "Send 1 row to Data Import");
     expect(payload.text).toBe("\"_\"\t\"Id\"\t\"Industry\"\r\n\"[Account]\"\t\"001000000000002AAA\"\t\"Insurance\"");
 
     // Data Import loads the rows with Update preselected
     await page.goto(importUrl);
     await expect(page.locator("button:has-text('Run Update')")).toBeVisible();
+  });
+
+  test("Locks display values and sends read-only columns as skipped", async ({page, context, extensionId}) => {
+    await openWithData(page, extensionId, {
+      header: ["_", "Id", "Name", "Industry", "Owner.Name"],
+      rows: [["[Account]", "001000000000001AAA", "Acme", "Énergie", "Ann"]],
+      query: "SELECT Id, Name, toLabel(Industry), Owner.Name FROM Account WHERE FORMAT(Name) != null"
+    });
+
+    await expect(cell(page, 0, 3)).toHaveClass(/de-locked/);
+    await expect(cell(page, 0, 3)).toHaveAttribute("title", /Display value/);
+    // Only the SELECT clause counts
+    await expect(cell(page, 0, 2)).not.toHaveClass(/de-locked/);
+
+    await page.getByText("Changes only").click();
+    const {payload} = await sentPayload(page, context, "Send 1 row to Data Import");
+    expect(payload.text.split("\r\n")[0]).toBe("\"_\"\t\"Id\"\t\"Name\"\t\"_Industry\"\t\"_Owner.Name\"");
+  });
+
+  test("Locks aggregate query results", async ({page, extensionId}) => {
+    await openWithData(page, extensionId, {
+      header: ["_", "Industry", "expr0"],
+      rows: [["[AggregateResult]", "Energy", "5"]]
+    });
+
+    await expect(cell(page, 0, 2)).toHaveAttribute("title", "Aggregate query results cannot be imported");
+    await page.getByText("Changes only").click();
+    await expect(page.getByRole("button", {name: "Send 1 row to Data Import"})).toBeDisabled();
   });
 });
