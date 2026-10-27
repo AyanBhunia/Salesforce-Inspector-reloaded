@@ -4,6 +4,7 @@ import {getLinkTarget, nullToEmptyString, isOptionEnabled, PromptTemplate, Const
 /* global initButton */
 import {Enumerable, DescribeInfo, initScrollTable, s} from "./data-load.js";
 import {PageHeader} from "./components/PageHeader.js";
+import {saveHandoff} from "./data-editor-handoff.js";
 
 function createQueryHistory(storageKey, max) {
   const isSaved = storageKey === "insextSavedQueryHistory";
@@ -292,6 +293,17 @@ class Model {
     if (this.queryTooling) args.set("apitype", "Tooling");
 
     window.open("data-import.html?" + args, getLinkTarget(e, false));
+  }
+  openInEditor() {
+    let [header, ...rows] = this.exportedData.getVisibleStrings();
+    let payload = {header, rows, apiType: this.queryTooling ? "Tooling" : "Enterprise"};
+    this.spinFor(saveHandoff(payload).then(key => {
+      let args = new URLSearchParams();
+      args.set("host", this.sfHost);
+      args.set("handoff", key);
+      // Always a new tab, so the query and its results stay available here
+      window.open("data-editor.html?" + args, "_blank");
+    }));
   }
   /**
    * Notify React that we changed something, so it will rerender the view.
@@ -1307,6 +1319,7 @@ function RecordTable(vm) {
         discoverColumns(record, "", row);
       }
     },
+    getVisibleStrings: () => rt.getVisibleTable().map(row => row.map(cellToString)),
     csvSerialize: separator => rt.getVisibleTable().map(row => row.map(cell => "\"" + cellToString(cell).split("\"").join("\"\"") + "\"").join(separator)).join("\r\n"),
     updateVisibility() {
       let filter = vm.resultsFilter;
@@ -1370,6 +1383,7 @@ class App extends React.Component {
     this.onDownloadAsCsv = this.onDownloadAsCsv.bind(this);
     this.onCopyAsJson = this.onCopyAsJson.bind(this);
     this.onDeleteRecords = this.onDeleteRecords.bind(this);
+    this.onOpenInEditor = this.onOpenInEditor.bind(this);
     this.onResultsFilterInput = this.onResultsFilterInput.bind(this);
     this.onSetQueryName = this.onSetQueryName.bind(this);
     this.onStopExport = this.onStopExport.bind(this);
@@ -1547,6 +1561,11 @@ class App extends React.Component {
   onDeleteRecords(e) {
     let {model} = this.props;
     model.deleteRecords(e);
+    model.didUpdate();
+  }
+  onOpenInEditor() {
+    let {model} = this.props;
+    model.openInEditor();
     model.didUpdate();
   }
   onResultsFilterInput(e) {
@@ -2072,6 +2091,12 @@ class App extends React.Component {
                   h("svg", {className: `slds-button__icon ${model.prefHideRelations ? "" : "disabled"}`},
                     h("use", {xlinkHref: "symbols.svg#hide"})
                   )
+                ),
+                h("button", {className: "slds-button slds-button_neutral", disabled: !model.canCopy(), onClick: this.onOpenInEditor, title: "Edit the results in a spreadsheet-like table, then send the changes to Data Import"},
+                  h("svg", {className: "slds-button__icon slds-button__icon_left"},
+                    h("use", {xlinkHref: "symbols.svg#edit"})
+                  ),
+                  "Edit"
                 ),
                 isOptionEnabled("delete", this.state.hideButtonsOption)
                   ? h("button", {className: "slds-button slds-button_destructive", disabled: !model.canDelete(), onClick: this.onDeleteRecords, title: "Open the 'Data Import' page with preloaded records to delete (< 20k records). 'Id' field needs to be queried"}, "Delete Records") : null,
