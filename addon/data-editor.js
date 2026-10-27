@@ -1,5 +1,5 @@
 /* global React ReactDOM */
-import {sfConn} from "./inspector.js";
+import {sfConn, apiVersion} from "./inspector.js";
 /* global initButton */
 import {csvParse} from "./csv-parse.js";
 import {PageHeader} from "./components/PageHeader.js";
@@ -13,9 +13,51 @@ const COLUMN_OVERSCAN = 2;
 const MAX_UNDO = 200;
 const collator = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
 
-function isLockedColumn(name) {
+function isKeyColumn(name) {
   // "_" holds the record type ("[Account]") and Id identifies the record for Data Import
   return name == "_" || name.toLowerCase() == "id";
+}
+
+function isValidDate(value) {
+  return /^\d{4}-\d\d-\d\d$/.test(value) && !isNaN(Date.parse(value)) && new Date(value).toISOString().startsWith(value);
+}
+
+const TIME = "([01]\\d|2[0-3]):[0-5]\\d(:[0-5]\\d(\\.\\d+)?)?";
+
+// Checks a value against the field describe, as Data Import would send it. Returns a warning or "".
+function fieldWarning(field, value) {
+  let v = value.trim();
+  if (v == "") return field.nillable ? "" : "Required field";
+  let picklist = () => (field.picklistValues || []).filter(p => p.active).map(p => p.value);
+  switch (field.type) {
+    case "boolean":
+      return /^(true|false|1|0)$/i.test(v) ? "" : "Expected true or false";
+    case "int":
+      return /^[-+]?\d+$/.test(v) ? "" : "Expected a whole number";
+    case "double":
+    case "currency":
+    case "percent":
+      return /^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$/.test(v) ? "" : "Expected a number, with . as decimal separator and no thousands separator";
+    case "date":
+      return isValidDate(v) ? "" : "Expected a date as YYYY-MM-DD";
+    case "datetime":
+      return new RegExp("^\\d{4}-\\d\\d-\\d\\dT" + TIME + "(Z|[+-]\\d\\d:?\\d\\d)?$").test(v) && isValidDate(v.slice(0, 10)) ? "" : "Expected a date and time as YYYY-MM-DDThh:mm:ssZ";
+    case "time":
+      return new RegExp("^" + TIME + "Z?$").test(v) ? "" : "Expected a time as hh:mm:ss";
+    case "email":
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? "" : "Expected an email address";
+    case "id":
+    case "reference":
+      return /^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$/.test(v) ? "" : "Expected a record Id (15 or 18 characters)";
+    case "picklist":
+    case "multipicklist": {
+      let items = field.type == "picklist" ? [v] : v.split(";").map(item => item.trim()).filter(item => item);
+      let unknown = items.filter(item => !picklist().includes(item));
+      return unknown.length == 0 ? ""
+        : "Not an active value of this picklist: " + unknown.join(", ") + (field.restrictedPicklist ? "" : " (accepted, the picklist is not restricted)");
+    }
+  }
+  return field.length && value.length > field.length ? "Too long: " + value.length + " characters, max " + field.length : "";
 }
 
 function estimateWidth(name, rows, c) {
@@ -45,7 +87,8 @@ class Model {
     this.userInfoModel = new UserInfoModel(this.spinFor.bind(this));
     applyProductionStyling(sfHost);
 
-    this.columns = []; // {name, width, locked}
+    this.columns = []; // {name, width, locked, createOnly, reason, field}, see columnAccess
+    this.fields = null; // Map of lower case field name to field describe, once the object's describe is loaded
     this.rows = []; // {cells: string[], orig: string[] | null}. orig is null for rows added in the editor
     this.view = []; // the rows currently displayed, after filter and sort
     this.filter = "";
@@ -74,15 +117,16 @@ class Model {
   }
 
   setTable(header, rows, {apiType, changesOnly}) {
-    this.columns = header.map((name, c) => ({name, width: estimateWidth(name, rows, c), locked: isLockedColumn(name)}));
-    this.rows = rows.map(cells => {
-      let padded = header.map((_, c) => cells[c] ?? "");
-      return {cells: padded, orig: padded.slice()};
-    });
     let typeColumn = header.indexOf("_");
     let typeCell = typeColumn >= 0 && rows[0] ? rows[0][typeColumn] : "";
     this.sobject = /^\[\w+\]$/.test(typeCell) ? typeCell.slice(1, -1) : "";
     this.apiType = apiType || "Enterprise";
+    this.fields = null;
+    this.columns = header.map((name, c) => ({name, width: estimateWidth(name, rows, c), ...this.columnAccess(name)}));
+    this.rows = rows.map(cells => {
+      let padded = header.map((_, c) => cells[c] ?? "");
+      return {cells: padded, orig: padded.slice()};
+    });
     this.changesOnly = changesOnly;
     this.undoStack = [];
     this.redoStack = [];
@@ -92,6 +136,51 @@ class Model {
     this.sentVersion = this.version;
     this.refreshView();
     document.title = "Data Editor" + (this.sobject ? " - " + this.sobject : "");
+    this.loadDescribe();
+  }
+
+  // ---------- Field access and types ----------
+
+  loadDescribe() {
+    if (!this.sobject) return;
+    let sobject = this.sobject;
+    let path = "/services/data/v" + apiVersion + (this.apiType == "Tooling" ? "/tooling" : "") + "/sobjects/" + sobject + "/describe";
+    this.spinFor(sfConn.rest(path).then(describe => {
+      if (this.sobject != sobject) return;
+      this.fields = new Map(describe.fields.map(field => [field.name.toLowerCase(), field]));
+      for (let col of this.columns) Object.assign(col, this.columnAccess(col.name));
+      this.version++; // Warnings depend on the describe
+    }, err => {
+      // Without the describe every column stays editable, as for pasted data
+      console.error("Data Editor: could not describe " + sobject, err);
+    }));
+  }
+
+  columnAccess(name) {
+    let access = (locked, reason, field = null, createOnly = false) => ({locked, reason, field, createOnly});
+    if (name == "_") return access(true, "Record type, used by Data Import to find the object");
+    if (name.toLowerCase() == "id") return access(true, "Record Id, used by Data Import to find the record");
+    if (!this.fields || name.includes(":")) return access(false, ""); // No describe (pasted data), or Data Import's Relationship:Object:ExternalIdField syntax
+    let field = this.fields.get(name.toLowerCase());
+    if (!field) {
+      return access(true, name.includes(".")
+        ? "Field of a related record (parent or subquery): it cannot be written from this table"
+        : "Not a field of " + this.sobject + " (related record, subquery or alias)");
+    }
+    if (field.updateable) return access(false, "", field);
+    if (field.createable) return access(false, "Can only be set on new rows", field, true);
+    return access(true, "Read-only field (formula, system or compound field, or no edit access)", field);
+  }
+
+  isCellLocked(row, c) {
+    let col = this.columns[c];
+    return col.locked || (col.createOnly && !!row.orig);
+  }
+
+  cellWarning(row, c) {
+    // Only edited values are checked: the values from Salesforce are valid
+    let field = this.columns[c].field;
+    return field && !this.isCellLocked(row, c) && this.isCellDirty(row, c) ? fieldWarning(field, row.cells[c]) : "";
   }
 
   // ---------- View (filter + sort) ----------
@@ -145,11 +234,16 @@ class Model {
     if (this.statsCache?.version !== this.version) {
       let changedRows = 0;
       let newRows = 0;
+      let warnings = 0;
       for (let row of this.rows) {
         if (!row.orig) newRows++;
         else if (this.isRowChanged(row)) changedRows++;
+        else continue;
+        for (let c = 0; c < this.columns.length; c++) {
+          if (this.cellWarning(row, c)) warnings++;
+        }
       }
-      this.statsCache = {version: this.version, changedRows, newRows};
+      this.statsCache = {version: this.version, changedRows, newRows, warnings};
     }
     return this.statsCache;
   }
@@ -163,8 +257,10 @@ class Model {
   // "cells": {changes: [{row, c, before, after}]}
   // "insert" / "delete": {items: [{row, index, viewIndex}]} sorted by ascending index in this.rows.
   //   The view position is restored as is, so undo/redo does not re-apply the filter and sort (rows would jump or vanish).
-  // "column": {col}, a column added at the end
+  // "column": {index, col, remove}: adds a column (remove false) or removes one (remove true).
+  //   values maps each row to its [cell, orig] in that column, recorded when the column is removed.
   // "batch": {actions: [...]}
+  // Actions are only undone/redone in stack order, so the row and column indexes they hold are always valid.
 
   applyAction(action, isUndo) {
     switch (action.type) {
@@ -186,14 +282,27 @@ class Model {
           this.view = this.view.filter(row => !removed.has(row));
         }
         break;
-      case "column":
-        if (isUndo) this.columns.pop(); else this.columns.push(action.col);
-        for (let row of this.rows) {
-          for (let cells of row.orig ? [row.cells, row.orig] : [row.cells]) {
-            if (isUndo) cells.pop(); else cells.push("");
+      case "column": {
+        let {index} = action;
+        if (action.remove == isUndo) {
+          // The describe may have arrived since the column was removed
+          this.columns.splice(index, 0, Object.assign(action.col, this.columnAccess(action.col.name)));
+          for (let row of this.rows) {
+            let [cell, orig] = action.values?.get(row) || ["", ""];
+            row.cells.splice(index, 0, cell);
+            if (row.orig) row.orig.splice(index, 0, orig);
           }
+          if (this.sort && this.sort.col >= index) this.sort.col++;
+          if (action.sortDir) this.sort = {col: index, dir: action.sortDir};
+        } else {
+          this.columns.splice(index, 1);
+          action.values = new Map(this.rows.map(row => [row, [row.cells.splice(index, 1)[0], row.orig?.splice(index, 1)[0]]]));
+          action.sortDir = this.sort?.col == index ? this.sort.dir : 0;
+          if (this.sort?.col == index) this.sort = null;
+          else if (this.sort?.col > index) this.sort.col--;
         }
         break;
+      }
       case "batch":
         for (let child of isUndo ? action.actions.slice().reverse() : action.actions) {
           this.applyAction(child, isUndo);
@@ -230,7 +339,7 @@ class Model {
   cellChanges(edits) {
     // edits: [{row, c, value}]. Locked and unchanged cells are ignored.
     return edits
-      .filter(({row, c, value}) => !this.columns[c].locked && row.cells[c] !== value)
+      .filter(({row, c, value}) => !this.isCellLocked(row, c) && row.cells[c] !== value)
       .map(({row, c, value}) => ({row, c, before: row.cells[c], after: value}));
   }
 
@@ -271,14 +380,38 @@ class Model {
   addColumn(name) {
     name = (name || "").trim();
     if (!name) return;
-    if (isLockedColumn(name) || this.columns.some(col => col.name.toLowerCase() == name.toLowerCase())) {
-      this.errorMessage = "The column " + name + " cannot be added: it already exists or is read-only.";
+    let access = this.columnAccess(name);
+    name = access.field?.name || name; // The API name, as Data Import expects it
+    let error = this.columns.some(col => col.name.toLowerCase() == name.toLowerCase()) ? "It is already in the table."
+      : access.locked ? access.reason + "."
+      : "";
+    if (error) {
+      this.errorMessage = "The column " + name + " cannot be added. " + error;
       return;
     }
     this.errorMessage = "";
-    this.execute({type: "column", col: {name, width: estimateWidth(name, [], 0), locked: false}});
-    let c = this.columns.length - 1;
+    let c = this.columns.length;
+    this.execute({type: "column", index: c, col: {name, width: estimateWidth(name, [], 0), ...access}, remove: false});
     this.sel = this.view.length > 0 ? {ar: 0, ac: c, fr: 0, fc: c} : null;
+  }
+
+  deleteSelectedColumns() {
+    // Removes the columns from this table only; "_" and Id are kept for Data Import
+    if (!this.sel) return;
+    let {c1, c2} = this.selRange();
+    let actions = [];
+    for (let c = c2; c >= c1; c--) {
+      if (!isKeyColumn(this.columns[c].name)) actions.push({type: "column", index: c, col: this.columns[c], remove: true});
+    }
+    if (actions.length == 0 || actions.length == this.columns.length) {
+      this.errorMessage = actions.length == 0 ? "The _ and Id columns cannot be deleted: Data Import needs them." : "At least one column must remain.";
+      return;
+    }
+    this.errorMessage = "";
+    this.execute({type: "batch", actions});
+    // Select a single cell where the columns were, not the columns that moved in
+    this.sel = null;
+    this.select(0, c1, false);
   }
 
   replaceAll(find, replacement) {
@@ -343,7 +476,7 @@ class Model {
   }
 
   activeLocked() {
-    return !this.sel || this.columns[this.sel.fc].locked;
+    return !this.sel || this.isCellLocked(this.view[this.sel.fr], this.sel.fc);
   }
 
   // ---------- Editing ----------
@@ -472,7 +605,7 @@ class Model {
     let cols = this.columns.map((_, c) => c);
     if (this.changesOnly) {
       // Keep the record type, the Id and the columns that were actually changed, so unchanged fields are not overwritten
-      cols = cols.filter(c => this.columns[c].locked || rows.some(row => this.isCellDirty(row, c)));
+      cols = cols.filter(c => isKeyColumn(this.columns[c].name) || rows.some(row => this.isCellDirty(row, c)));
     }
     // Without any Id value (only new rows), drop the column so Data Import proposes Insert instead of Update
     cols = cols.filter(c => this.columns[c].name.toLowerCase() != "id" || rows.some(row => row.cells[c] != ""));
@@ -729,7 +862,10 @@ class Grid extends React.Component {
     let col = model.columns[c];
     let active = model.sel && model.sel.fr == r && model.sel.fc == c;
     let editingHere = active && model.editing;
-    let className = (col.locked ? "de-locked " : "")
+    let locked = model.isCellLocked(row, c);
+    let warning = editingHere ? "" : model.cellWarning(row, c);
+    let className = (locked ? "de-locked " : "")
+      + (warning ? "de-warning " : "")
       + (model.isCellDirty(row, c) ? "de-dirty " : "")
       + (model.isSelected(r, c) ? "de-selected " : "")
       + (active ? "de-active " : "")
@@ -752,7 +888,11 @@ class Grid extends React.Component {
       );
     }
     let value = editingHere ? model.editing.value : row.cells[c];
-    return h("td", {key: c, "data-r": r, "data-c": c, className, title: value.length > 30 ? value : null}, value);
+    let title = warning || (locked && col.reason) || (value.length > 30 ? value : null);
+    return h("td", {key: c, "data-r": r, "data-c": c, className, title},
+      warning ? h("svg", {className: "de-warning-icon", "aria-label": warning}, h("use", {xlinkHref: "symbols.svg#warning"})) : null,
+      value
+    );
   }
 
   renderHeader(c) {
@@ -761,7 +901,7 @@ class Grid extends React.Component {
     return h("th", {
       key: c,
       className: col.locked ? "de-locked" : null,
-      title: col.name + (col.locked ? " (read-only)" : "") + " - click to sort",
+      title: col.name + (col.field ? " (" + col.field.type + ")" : "") + (col.reason ? "\n" + col.reason : "") + "\nClick to sort",
       onClick: () => { model.toggleSort(c); model.didUpdate(); }
     },
     h("div", {className: "de-th-inner"},
@@ -958,7 +1098,7 @@ class App extends React.Component {
 
   renderToolbar() {
     let {model} = this.props;
-    let {changedRows, newRows} = model.stats();
+    let {changedRows, newRows, warnings} = model.stats();
     let sendCount = model.rowsToSend().length;
     let filtered = model.view.length != model.rows.length;
     return h("div", {className: "de-toolbar"},
@@ -969,7 +1109,8 @@ class App extends React.Component {
       h("div", {className: "slds-button-group", role: "group"},
         this.textButton("add", "Row", "Add an empty row below the selection", () => this.act(() => model.addRow()), false),
         this.textButton("add", "Column", "Add a column at the end, to set a field that was not queried", () => this.addColumn(), false),
-        this.textButton("delete", "Delete rows", "Remove the selected rows from this table (nothing is deleted in Salesforce)", () => this.act(() => model.deleteSelectedRows()), !model.sel)
+        this.textButton("delete", "Delete rows", "Remove the selected rows from this table (nothing is deleted in Salesforce)", () => this.act(() => model.deleteSelectedRows()), !model.sel),
+        this.textButton("delete", "Delete columns", "Remove the selected columns from this table (nothing is deleted in Salesforce). The _ and Id columns are kept.", () => this.act(() => model.deleteSelectedColumns()), !model.sel)
       ),
       this.textButton("replace", "Replace", "Find and replace (Ctrl+H), in the selected cells or in all the rows shown", () => this.toggleReplace(!this.state.replace), false),
       h("div", {className: "slds-form-element de-filter"},
@@ -987,7 +1128,8 @@ class App extends React.Component {
       ),
       h("span", {className: "de-stats"},
         model.view.length.toLocaleString() + (filtered ? " of " + model.rows.length.toLocaleString() : "") + " rows",
-        changedRows + newRows > 0 ? h("strong", null, " · " + (changedRows ? changedRows + " edited" : "") + (changedRows && newRows ? ", " : "") + (newRows ? newRows + " new" : "")) : null
+        changedRows + newRows > 0 ? h("strong", null, " · " + (changedRows ? changedRows + " edited" : "") + (changedRows && newRows ? ", " : "") + (newRows ? newRows + " new" : "")) : null,
+        warnings > 0 ? h("strong", {className: "de-stats-warning", title: "Edited values that do not match the field type. Point at the warning icons for details."}, " · " + warnings + (warnings == 1 ? " warning" : " warnings")) : null
       ),
       h("div", {className: "de-spacer"}),
       h("div", {className: "slds-button-group", role: "group"},
@@ -1042,12 +1184,16 @@ class App extends React.Component {
     if (!model.sel) return null;
     let col = model.columns[model.sel.fc];
     let fromBar = model.editing?.source == "bar";
+    let row = model.view[model.sel.fr];
+    let locked = model.isCellLocked(row, model.sel.fc);
+    let warning = model.editing ? "" : model.cellWarning(row, model.sel.fc);
+    let note = warning || (locked ? col.reason : "") || (col.field ? col.field.type : "");
     return h("div", {className: "de-valuebar"},
       h("span", {className: "de-cellref", title: col.name}, col.name + " · row " + (model.sel.fr + 1)),
       h("input", {
         className: "slds-input",
         "aria-label": "Cell value",
-        readOnly: col.locked,
+        readOnly: locked,
         value: model.editing ? model.editing.value : model.activeValue(),
         onFocus: () => { model.beginEdit(null, "bar"); model.didUpdate(); },
         onChange: e => {
@@ -1060,7 +1206,8 @@ class App extends React.Component {
           if (e.key == "Escape") { model.cancelEdit(); this.grid?.scroller.focus(); model.didUpdate(); }
         },
         onBlur: () => { if (fromBar && model.editing) { model.commitEdit(); model.didUpdate(); } }
-      })
+      }),
+      note ? h("span", {className: "de-cellnote" + (warning ? " de-cellnote-warning" : ""), title: note}, note) : null
     );
   }
 

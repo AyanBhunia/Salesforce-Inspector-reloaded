@@ -3,13 +3,14 @@ import {
   TEST_CONSTANTS,
   injectSessionData,
   pasteData,
+  fulfillSuccess,
 } from "./test-helpers";
 import {routeMock} from "./test-mock";
 
 test.describe("Data Editor", () => {
   const {mockHost, mockToken, apiVersion} = TEST_CONSTANTS;
 
-  test.beforeEach(async ({context}) => {
+  test.beforeEach(async ({context, page}) => {
     await injectSessionData(context, {
       host: mockHost,
       token: mockToken,
@@ -26,7 +27,29 @@ test.describe("Data Editor", () => {
       }
       await route.continue();
     });
+    // The editor's own Account describe (page routes run before the context's generic mock)
+    await page.route(/\/sobjects\/Account\/describe(\?|$)/, route => fulfillSuccess(route, accountDescribe));
   });
+
+  const picklist = values => values.map(value => ({value, label: value, active: true}));
+  const accountDescribe = {
+    name: "Account",
+    fields: [
+      {name: "Id", type: "id", createable: false, updateable: false, nillable: false},
+      {name: "Name", type: "string", length: 20, createable: true, updateable: true, nillable: false},
+      {name: "Industry",
+        type: "picklist",
+        length: 255,
+        createable: true,
+        updateable: true,
+        nillable: true,
+        picklistValues: picklist(["Banking", "Energy", "Insurance", "Media", "Retail"])},
+      {name: "NumberOfEmployees", type: "int", createable: true, updateable: true, nillable: true},
+      {name: "Description", type: "textarea", length: 32000, createable: true, updateable: true, nillable: true},
+      {name: "Site", type: "string", length: 80, createable: true, updateable: false, nillable: true},
+      {name: "CreatedDate", type: "datetime", createable: false, updateable: false, nillable: false}
+    ]
+  };
 
   const header = ["_", "Id", "Name", "Industry"];
   const rows = [
@@ -35,15 +58,17 @@ test.describe("Data Editor", () => {
     ["[Account]", "001000000000003AAA", "Initech", ""],
   ];
 
-  async function openWithData(page, extensionId) {
+  async function openWithData(page, extensionId, data = {header, rows}) {
     // Seed the handoff store the same way Data Export does, then open the editor with its key
     await page.goto(`chrome-extension://${extensionId}/data-editor.html?host=${mockHost}`);
     const key = await page.evaluate(async payload => {
       const {saveHandoff} = await import("./data-editor-handoff.js");
       return saveHandoff(payload);
-    }, {header, rows, apiType: "Enterprise"});
+    }, {...data, apiType: "Enterprise"});
     await page.goto(`chrome-extension://${extensionId}/data-editor.html?host=${mockHost}&handoff=${key}`);
     await expect(page.locator(".de-grid tbody tr").filter({hasText: "Acme"})).toBeVisible();
+    // The describe is loaded: the Name header (column 2) shows its type
+    await expect(page.locator(".de-grid thead th").nth(3)).toHaveAttribute("title", /^Name \(string\)/);
   }
 
   function cell(page, r, c) {
@@ -201,7 +226,12 @@ test.describe("Data Editor", () => {
   test("Adds a column and sends it with the changes", async ({page, extensionId}) => {
     await openWithData(page, extensionId);
 
-    page.once("dialog", dialog => dialog.accept("Description"));
+    // Only fields that can be written are accepted
+    page.once("dialog", dialog => dialog.accept("Foo__c"));
+    await page.getByRole("button", {name: "Column", exact: true}).click();
+    await expect(page.getByRole("alert")).toContainText("Not a field of Account");
+
+    page.once("dialog", dialog => dialog.accept("description"));
     await page.getByRole("button", {name: "Column", exact: true}).click();
     await expect(page.locator(".de-grid thead th").last()).toHaveText("Description");
     await expect(cell(page, 0, 4)).toHaveClass(/de-active/);
@@ -214,6 +244,105 @@ test.describe("Data Editor", () => {
     await page.keyboard.press("Control+z");
     await page.keyboard.press("Control+z");
     await expect(page.locator(".de-grid thead th")).toHaveText(["#", "_", "Id", "Name", "Industry"]);
+  });
+
+  test("Greys out the columns that cannot be written", async ({page, extensionId}) => {
+    await openWithData(page, extensionId, {
+      header: ["_", "Id", "Name", "Site", "CreatedDate", "Owner.Name"],
+      rows: [
+        ["[Account]", "001000000000001AAA", "Acme", "Paris", "2024-01-01T10:00:00.000+0000", "Ann"],
+        ["[Account]", "001000000000002AAA", "Globex", "Lyon", "2024-01-02T10:00:00.000+0000", "Bob"],
+      ]
+    });
+
+    await expect(cell(page, 0, 2)).not.toHaveClass(/de-locked/);
+    await expect(cell(page, 0, 4)).toHaveClass(/de-locked/);
+    await expect(cell(page, 0, 4)).toHaveAttribute("title", /Read-only field/);
+    await expect(cell(page, 0, 5)).toHaveClass(/de-locked/);
+    await expect(cell(page, 0, 5)).toHaveAttribute("title", /related record/);
+    await expect(page.locator(".de-grid thead th", {hasText: "Owner.Name"})).toHaveClass(/de-locked/);
+
+    await cell(page, 0, 5).click();
+    await page.keyboard.type("x");
+    await expect(cell(page, 0, 5)).toHaveText("Ann");
+
+    // A create-only field is locked on existing rows, editable on new rows
+    await expect(cell(page, 0, 3)).toHaveClass(/de-locked/);
+    await cell(page, 1, 3).click();
+    await page.getByRole("button", {name: "Row", exact: true}).click();
+    await expect(cell(page, 2, 3)).not.toHaveClass(/de-locked/);
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.type("Nice");
+    await page.keyboard.press("Enter");
+    await expect(cell(page, 2, 3)).toHaveText("Nice");
+  });
+
+  test("Warns about edited values that do not match the field type", async ({page, extensionId}) => {
+    await openWithData(page, extensionId, {
+      header: ["_", "Id", "Name", "Industry", "NumberOfEmployees"],
+      rows: [
+        ["[Account]", "001000000000001AAA", "Acme", "Energy", "10"],
+        ["[Account]", "001000000000002AAA", "Globex", "Banking", "20"],
+      ]
+    });
+
+    const edit = async (r, c, value) => {
+      await cell(page, r, c).click();
+      await page.keyboard.press("F2");
+      await page.keyboard.press("Control+a");
+      await page.keyboard.type(value);
+      await page.keyboard.press("Enter");
+    };
+
+    await edit(0, 4, "12k");
+    await expect(cell(page, 0, 4)).toHaveClass(/de-warning/);
+    await expect(cell(page, 0, 4)).toHaveAttribute("title", "Expected a whole number");
+    await expect(cell(page, 0, 4).locator(".de-warning-icon")).toBeVisible();
+    await expect(page.locator(".de-stats")).toContainText("1 warning");
+
+    await edit(1, 3, "Retial");
+    await expect(cell(page, 1, 3)).toHaveAttribute("title", "Not an active value of this picklist: Retial (accepted, the picklist is not restricted)");
+    await edit(0, 2, "A name longer than twenty characters");
+    await expect(cell(page, 0, 2)).toHaveAttribute("title", /Too long/);
+    await cell(page, 1, 2).click();
+    await page.keyboard.press("Delete");
+    await expect(cell(page, 1, 2)).toHaveAttribute("title", "Required field");
+    await expect(page.locator(".de-stats")).toContainText("4 warnings");
+    // The value bar explains the active cell
+    await expect(page.locator(".de-cellnote")).toHaveText("Required field");
+
+    await edit(0, 4, "12000");
+    await expect(cell(page, 0, 4)).not.toHaveClass(/de-warning/);
+    await expect(page.locator(".de-stats")).toContainText("3 warnings");
+  });
+
+  test("Deletes columns and undoes it", async ({page, extensionId}) => {
+    await openWithData(page, extensionId);
+
+    await cell(page, 0, 3).click();
+    await page.keyboard.type("Media");
+    await page.keyboard.press("Enter");
+
+    await page.locator(".de-grid thead th", {hasText: "Industry"}).click();
+    await cell(page, 0, 2).click();
+    await cell(page, 0, 3).click({modifiers: ["Shift"]});
+    await page.getByRole("button", {name: "Delete columns"}).click();
+    await expect(page.locator(".de-grid thead th")).toHaveText(["#", "_", "Id"]);
+
+    // Undo restores the columns, their values and the sort
+    await page.keyboard.press("Control+z");
+    await expect(page.locator(".de-grid thead th")).toHaveText(["#", "_", "Id", "Name", "Industry▲"]);
+    // Sorted by Industry: Banking, Media (the edited cell), then the empty value
+    await expect(page.locator(".de-grid td.de-dirty")).toHaveText("Media");
+    await expect(cell(page, 0, 3)).toHaveText("Banking");
+
+    // The keys stay
+    await cell(page, 0, 1).click();
+    await page.getByRole("button", {name: "Delete columns"}).click();
+    await expect(page.getByRole("alert")).toContainText("cannot be deleted");
+    await expect(page.locator(".de-grid thead th")).toHaveCount(5);
   });
 
   test("Renders only the visible columns of a wide table", async ({page, extensionId}) => {

@@ -123,13 +123,54 @@
   color: #0176d3;
 }
 
+/* Read-only cells: keys, formula/system fields, parent and subquery fields */
 .de-grid .de-locked {
-  color: #706e6b;
-  background: #fafaf9;
+  color: #939393;
+  background: #f0f0f0;
+  cursor: not-allowed;
 }
 
 .de-grid thead .de-locked {
-  background: #f3f3f3;
+  color: #706e6b;
+  font-style: italic;
+  background: #ebebeb;
+  cursor: pointer;
+}
+
+.de-grid td.de-locked.de-selected {
+  background: #d5dbe5;
+}
+
+/* Edited value that does not match the field type */
+.de-grid td.de-warning {
+  position: relative;
+  padding-right: 20px;
+}
+
+.de-grid .de-warning-icon {
+  position: absolute;
+  top: 6px;
+  right: 4px;
+  width: 13px;
+  height: 13px;
+  fill: #dd7a01;
+}
+
+.de-stats .de-stats-warning {
+  color: #dd7a01;
+}
+
+.de-valuebar .de-cellnote {
+  max-width: 24rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #706e6b;
+}
+
+.de-valuebar .de-cellnote-warning {
+  color: #b75d00;
+  font-weight: bold;
 }
 
 .de-grid td.de-dirty {
